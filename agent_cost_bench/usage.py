@@ -1,0 +1,1470 @@
+"""
+Usage / cost parsing for each supported CLI, normalized to a common ``Usage``.
+
+Every parser returns cost in BOTH USD and native units (credits / premium
+requests) so the reports can always show them side by side.
+
+  Kiro      ──  "▸ Credits: 0.05 • Time: 2s" telemetry line on stderr.
+                USD = credits × pricing.usd_per_credit.
+
+  Claude    ──  `claude -p --output-format json` prints a result object with
+  Code          total_cost_usd, duration_ms, and a usage{} token block. USD is
+                reported directly — no pricing table needed.
+
+  Devin     ──  the CLI prints no cost telemetry, but `devin -p --export <file>`
+                writes an ATIF conversation export whose `final_metrics` block
+                carries cumulative token counts. Read from the run's workspace
+                and priced with the per-token rates from the config.
+
+  Copilot   ──  `copilot --output-format json` prints JSONL. Cost comes from the
+                real AI-credit (AIU) telemetry: newer CLIs stream a per-turn
+                `total_nano_aiu` in each `model.model_call_success` event (summed
+                across turns); older CLIs write `totalNanoAiu` to
+                ~/.copilot/session-state/<id>/events.jsonl (located via a
+                `type:result` event's sessionId). 1 AIU = 1 AI Credit = $0.01.
+                When no AIU source is present, cost is None — we do NOT fall back
+                to a flat premiumRequests multiplier, which understates an agentic
+                run (dozens–hundreds of credits) by orders of magnitude.
+
+A generic ``tokens`` regex parser and a fixed ``premium_request`` parser let a
+new CLI be added from config alone.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time as _time
+from pathlib import Path
+
+from .models import CostSource, Pricing, Target, Usage
+
+# ---------------------------------------------------------------------------
+# Kiro credits/time telemetry
+# ---------------------------------------------------------------------------
+
+_CREDITS_RE = re.compile(r"Credits?\s*[:=]\s*([0-9][0-9,]*\.?[0-9]*)", re.IGNORECASE)
+_TIME_RE = re.compile(
+    r"Time\s*[:=]\s*("
+    r"\d+\s*h\s*\d+\s*m\s*\d+(?:\.\d+)?\s*s"
+    r"|\d+\s*h\s*\d+(?:\.\d+)?\s*m"
+    r"|\d+\s*m\s*\d+(?:\.\d+)?\s*s"
+    r"|\d+(?:\.\d+)?\s*h"
+    r"|\d+(?:\.\d+)?\s*m"
+    r"|\d+(?:\.\d+)?\s*s"
+    r"|\d+(?:\.\d+)?"
+    r")",
+    re.IGNORECASE,
+)
+_HAS_CREDITS = re.compile(r"Credits?\s*[:=]", re.IGNORECASE)
+_HAS_TIME = re.compile(r"\bTime\s*[:=]", re.IGNORECASE)
+_H = re.compile(r"(\d+(?:\.\d+)?)\s*h", re.IGNORECASE)
+_M = re.compile(r"(\d+(?:\.\d+)?)\s*m", re.IGNORECASE)
+_S = re.compile(r"(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+
+
+def _safe_int(val) -> int | None:
+    """Convert a value to int if it's numeric, else None."""
+    if isinstance(val, (int, float)):
+        return int(val)
+    return None
+
+
+def _to_seconds(token: str) -> float | None:
+    token = token.strip()
+    if not token:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", token):
+        return float(token)
+    total = 0.0
+    matched = False
+    if (h := _H.search(token)):
+        total += float(h.group(1)) * 3600
+        matched = True
+    if (m := _M.search(token)):
+        total += float(m.group(1)) * 60
+        matched = True
+    if (s := _S.search(token)):
+        total += float(s.group(1))
+        matched = True
+    return total if matched else None
+
+
+def _parse_credits(text: str) -> float | None:
+    matches = _CREDITS_RE.findall(text or "")
+    if not matches:
+        return None
+    try:
+        return float(matches[-1].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _parse_time_seconds(text: str) -> float | None:
+    matches = _TIME_RE.findall(text or "")
+    if not matches:
+        return None
+    return _to_seconds(matches[-1].strip())
+
+
+def _find_telemetry_line(text: str) -> str | None:
+    if not text:
+        return None
+    found = None
+    for line in text.splitlines():
+        if _HAS_CREDITS.search(line) and _HAS_TIME.search(line):
+            found = line
+    return found
+
+
+def parse_kiro_credits_time(stdout: str, stderr: str = "") -> tuple[float | None, float | None]:
+    """Return (credits, time_seconds) from Kiro CLI output. Anchored to the
+    combined 'Credits ... Time' telemetry banner; falls back to a per-field scan
+    (stderr first) so model-generated stdout text can't override real telemetry."""
+    for stream in (stderr, stdout):
+        line = _find_telemetry_line(stream)
+        if line is not None:
+            return _parse_credits(line), _parse_time_seconds(line)
+    for stream in (stderr, stdout):
+        credits = _parse_credits(stream)
+        time_s = _parse_time_seconds(stream)
+        if credits is not None or time_s is not None:
+            return credits, time_s
+    return None, None
+
+
+def parse_kiro_stream_json_credits(stdout: str) -> float | None:
+    """Return total credits from the Kiro v3 ``--output-format stream-json``
+    event stream, or ``None`` when no credit telemetry is present.
+
+    Newer Kiro CLIs (v3) no longer print the ``▸ Credits: N • Time: Ns``
+    banner that ``parse_kiro_credits_time`` scrapes. Instead they emit JSON-Lines
+    on stdout; each user prompt produces one ``session_info_update`` event of
+    ``kind: "turn_completion"`` carrying::
+
+        {"type":"sessionUpdate","data":{"update":{
+            "sessionUpdate":"session_info_update",
+            "_meta":{"kiro":{
+                "promptTurnSummaries":[{"unit":"credit","usage":1.1099}],
+                "elapsedTime":10862,
+                "kind":"turn_completion"}}}}}
+
+    The turn's ``usage`` already aggregates the credits of every internal model
+    call for that prompt (one ``turn_completion`` may list several ``requestIds``).
+    We sum across ``turn_completion`` events defensively in case a single
+    invocation ever produces more than one.
+
+    kiro-cli 2.32+ (default v2 engine) reports credits differently: a
+    ``type: "metadata"`` event at the end of each turn carries a
+    ``meteringUsage`` list with one entry per model call in that turn::
+
+        {"type":"metadata","data":{
+            "meteringUsage":[{"value":0.2401,"unit":"credit"},
+                             {"value":0.1310,"unit":"credit"}],
+            "turnDurationMs":8178}}
+
+    Those values are summed across entries and events. When both shapes are
+    present, ``turn_completion`` wins so the same credits are never counted
+    twice.
+
+    NOTE: we deliberately do NOT return ``elapsedTime`` / ``turnDurationMs`` as
+    a latency. It is per-turn model time (and does not reliably total the run
+    duration), so surfacing it would override the harness's true wall-clock
+    measurement and make Kiro look far faster than it was. Latency comes from
+    wall-clock instead.
+    """
+    credits_total = 0.0
+    saw_credit = False
+    metering_total = 0.0
+    saw_metering = False
+    for obj in _find_json_objects(stdout):
+        if obj.get("type") == "metadata":
+            for entry in (obj.get("data") or {}).get("meteringUsage") or []:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("unit") == "credit"
+                    and isinstance(entry.get("value"), (int, float))
+                ):
+                    metering_total += float(entry["value"])
+                    saw_metering = True
+            continue
+        if obj.get("type") != "sessionUpdate":
+            continue
+        update = (obj.get("data") or {}).get("update") or {}
+        if update.get("sessionUpdate") != "session_info_update":
+            continue
+        kiro = (update.get("_meta") or {}).get("kiro") or {}
+        if kiro.get("kind") != "turn_completion":
+            continue
+        for summary in kiro.get("promptTurnSummaries") or []:
+            if not isinstance(summary, dict):
+                continue
+            if summary.get("unit") == "credit" and isinstance(
+                summary.get("usage"), (int, float)
+            ):
+                credits_total += float(summary["usage"])
+                saw_credit = True
+    if saw_credit:
+        return credits_total
+    return metering_total if saw_metering else None
+
+
+def parse_kiro_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    # Two output shapes, detected in this order:
+    #
+    #  v3 (--output-format stream-json): credits arrive in turn_completion
+    #     events. We take credits from there and DELIBERATELY leave seconds
+    #     unset — the stream's per-turn `elapsedTime` is not a run total, and
+    #     the loose credit/time text in the stream would otherwise be
+    #     mis-scraped as a tiny bogus latency. The harness then uses wall-clock.
+    #
+    #  v2 (older CLI): the "▸ Credits: N • Time: Ns" banner. Its Time is a
+    #     trustworthy run total, so we keep it.
+    #
+    # Stream-json is checked FIRST: when turn_completion events are present the
+    # v2 banner scraper's fallback field-scan can spuriously match credit/time
+    # substrings elsewhere in the JSON stream, so it must not run for v3 output.
+    sj_credits = parse_kiro_stream_json_credits(stdout)
+    if sj_credits is not None:
+        credits, time_s = sj_credits, None
+    else:
+        credits, time_s = parse_kiro_credits_time(stdout, stderr)
+    cost = None
+    if credits is not None and pricing.usd_per_credit is not None:
+        cost = credits * pricing.usd_per_credit
+    return Usage(cost_usd=cost, seconds=time_s, raw_credits=credits)
+
+
+# ---------------------------------------------------------------------------
+# JSON helpers (Claude / Copilot)
+# ---------------------------------------------------------------------------
+
+
+def _find_json_objects(text: str) -> list[dict]:
+    objs: list[dict] = []
+    text = (text or "").strip()
+    if not text:
+        return objs
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return [obj]
+        if isinstance(obj, list):
+            return [o for o in obj if isinstance(o, dict)]
+    except json.JSONDecodeError:
+        pass
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                objs.append(obj)
+        except json.JSONDecodeError:
+            continue
+    return objs
+
+
+def parse_claude_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    """Parse `claude -p --output-format json`.
+
+    Claude Code reports cached tokens separately:
+      - input_tokens: non-cached input
+      - cache_creation_input_tokens: tokens written to cache this turn
+      - cache_read_input_tokens: tokens read from cache
+    Total input = all three summed.
+    """
+    objs = _find_json_objects(stdout) or _find_json_objects(stderr)
+    result_obj = None
+    for o in objs:
+        if o.get("type") == "result" or "total_cost_usd" in o:
+            result_obj = o
+    if result_obj is None and objs:
+        result_obj = objs[-1]
+    if not result_obj:
+        return Usage()
+
+    cost = result_obj.get("total_cost_usd")
+    duration_ms = result_obj.get("duration_ms")
+    seconds = (duration_ms / 1000.0) if isinstance(duration_ms, (int, float)) else None
+    usage = result_obj.get("usage", {}) or {}
+
+    # Sum all input token buckets (non-cached + cache creation + cache read).
+    in_tok = _safe_int(usage.get("input_tokens"))
+    cache_create = _safe_int(usage.get("cache_creation_input_tokens"))
+    cache_read = _safe_int(usage.get("cache_read_input_tokens"))
+    total_in = None
+    if any(v is not None for v in (in_tok, cache_create, cache_read)):
+        total_in = (in_tok or 0) + (cache_create or 0) + (cache_read or 0)
+
+    out_tok = _safe_int(usage.get("output_tokens"))
+    return Usage(
+        cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
+        input_tokens=total_in,
+        output_tokens=out_tok,
+        seconds=seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Copilot JSONL + session-state AIU lookup
+# ---------------------------------------------------------------------------
+
+_TOKEN_IN_KEYS = ("input_tokens", "prompt_tokens", "inputTokens", "promptTokens")
+_TOKEN_OUT_KEYS = ("output_tokens", "completion_tokens", "outputTokens", "completionTokens")
+_SESSION_DURATION_KEYS = ("sessionDurationMs", "session_duration_ms")
+
+
+def _dig(obj: dict, keys: tuple[str, ...]):
+    for k in keys:
+        if k in obj and isinstance(obj[k], (int, float)):
+            return obj[k]
+    usage = obj.get("usage")
+    if isinstance(usage, dict):
+        for k in keys:
+            if k in usage and isinstance(usage[k], (int, float)):
+                return usage[k]
+    return None
+
+
+def _extract_copilot_session_id(stdout: str) -> str | None:
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+            if obj.get("type") == "result":
+                return obj.get("sessionId")
+        except Exception:
+            continue
+    return None
+
+
+def read_copilot_session_aiu(session_id: str, home: Path | None = None) -> float | None:
+    """
+    Read totalNanoAiu from ~/.copilot/session-state/<session_id>/events.jsonl
+    and convert to USD. Returns the cost in USD, or None if unavailable.
+    1 AIU = 1 AI Credit = $0.01; value stored in nano-AIU (1e9 nanoAIU = 1 AIU).
+    """
+    if not session_id:
+        return None
+    base = home or Path.home()
+    ev_file = base / ".copilot" / "session-state" / session_id / "events.jsonl"
+    if not ev_file.exists():
+        return None
+    try:
+        for line in ev_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if obj.get("type") == "session.shutdown":
+                nano_aiu = obj.get("data", {}).get("totalNanoAiu")
+                if isinstance(nano_aiu, (int, float)) and nano_aiu > 0:
+                    return (nano_aiu / 1_000_000_000) * 0.01
+    except Exception:
+        pass
+    return None
+
+
+def _sum_copilot_inline_aiu(objs: list[dict]) -> float | None:
+    """Sum the per-turn AIU cost that newer Copilot CLIs stream inline.
+
+    Copilot >= ~1.0.8x emits a ``model.model_call_success`` event per model turn
+    carrying the turn's AI-credit cost as ``total_nano_aiu`` (snake_case, in
+    nano-AIU: 1e9 nanoAIU = 1 AIU = 1 AI Credit = $0.01). The value appears at
+    two equivalent paths in the same event::
+
+        data.copilotUsage.total_nano_aiu
+        data.responseChunk.copilot_usage.total_nano_aiu
+
+    They are duplicates of the SAME turn cost, so we read at most ONE per event
+    (preferring ``copilotUsage``) to avoid double counting, and sum across turns
+    — the values are per-turn, not cumulative. Returns total AIU (credits) or
+    ``None`` when no such event is present (older CLIs).
+    """
+    total_nano = 0
+    saw = False
+    for o in objs:
+        if o.get("type") != "model.model_call_success":
+            continue
+        data = o.get("data")
+        if not isinstance(data, dict):
+            continue
+        nano = None
+        cu = data.get("copilotUsage")
+        if isinstance(cu, dict):
+            nano = cu.get("total_nano_aiu")
+        if nano is None:
+            rc = data.get("responseChunk")
+            if isinstance(rc, dict):
+                cu2 = rc.get("copilot_usage")
+                if isinstance(cu2, dict):
+                    nano = cu2.get("total_nano_aiu")
+        if isinstance(nano, (int, float)) and nano >= 0:
+            total_nano += nano
+            saw = True
+    if not saw:
+        return None
+    return total_nano / 1_000_000_000  # nano-AIU -> AIU (credits)
+
+
+def parse_copilot_usage(stdout: str, stderr: str, pricing: Pricing, home: Path | None = None) -> Usage:
+    """
+    Parse ``copilot --output-format json`` (JSONL) and derive cost from the real
+    AI-credit (AIU) telemetry, in priority order:
+
+      1. Inline per-turn ``total_nano_aiu`` streamed in ``model.model_call_success``
+         events (newer CLIs). Authoritative billed cost; needs no session file.
+      2. ``totalNanoAiu`` from the session-state ``session.shutdown`` record,
+         located via a ``type:result`` event's ``sessionId`` (older CLIs).
+
+    1 AIU = 1 AI Credit = $0.01. When neither AIU source is available, cost is
+    reported as ``None``. Copilot cost is derived purely from AIU — the legacy
+    ``premiumRequests`` multiplier is intentionally NOT used: it is wildly
+    inaccurate for an agentic run (one run bills dozens to hundreds of AI
+    credits, not one premium request) and misleadingly understates Copilot in a
+    cost comparison. Token counts are still reported for transparency.
+    """
+    objs = _find_json_objects(stdout) + _find_json_objects(stderr)
+    in_tok = out_tok = 0
+    saw_tokens = False
+    seconds = None
+    for o in objs:
+        i = _dig(o, _TOKEN_IN_KEYS)
+        out = _dig(o, _TOKEN_OUT_KEYS)
+        if i is not None:
+            in_tok += int(i)
+            saw_tokens = True
+        if out is not None:
+            out_tok += int(out)
+            saw_tokens = True
+        ms = _dig(o, _SESSION_DURATION_KEYS)
+        if ms is not None:
+            seconds = ms / 1000.0
+
+    cost = None
+    raw_credits = None
+
+    # 1. Inline per-turn AIU (newer Copilot CLIs) — authoritative billed cost.
+    inline_aiu = _sum_copilot_inline_aiu(objs)
+    if inline_aiu is not None:
+        raw_credits = inline_aiu
+        cost = inline_aiu * 0.01  # 1 AIU = $0.01
+
+    # 2. Otherwise, the session-state AIU record (older CLIs), located by sessionId.
+    if cost is None:
+        session_id = _extract_copilot_session_id(stdout)
+        if session_id:
+            real_cost = read_copilot_session_aiu(session_id, home=home)
+            if real_cost is not None:
+                cost = real_cost
+                raw_credits = real_cost / 0.01  # AIU credits driving the cost
+
+    return Usage(
+        cost_usd=cost,
+        input_tokens=in_tok if saw_tokens else None,
+        output_tokens=out_tok if saw_tokens else None,
+        seconds=seconds,
+        raw_credits=raw_credits,
+    )
+
+
+# ---------------------------------------------------------------------------
+# kas-proxy metrics.jsonl (cost correlated via X-Kas-Run-Id)
+# ---------------------------------------------------------------------------
+
+
+def _kas_metrics_path(pricing: Pricing) -> Path:
+    """Resolve the metrics.jsonl path with the default ~/.kas-proxy fallback."""
+    raw = pricing.kas_metrics_file or "~/.kas-proxy/metrics.jsonl"
+    return Path(raw).expanduser()
+
+
+def _find_kas_metrics_record(
+    path: Path, run_id: str, timeout_seconds: float, sleep: float = 0.1
+) -> dict | None:
+    """
+    Locate ALL metrics.jsonl records whose ``run_id`` matches, aggregate them,
+    and return a single combined dict.
+
+    A single CLI invocation (one run_id) may produce multiple inference turns
+    (the agent loop calls the model N times). Each turn writes one record. We
+    sum cost/tokens across all records for that run_id so the harness sees the
+    total task cost, not just one turn's.
+
+    The proxy may flush the last line a fraction of a second after the CLI
+    returns, so we poll the file until we either find at least one record or
+    exhaust the timeout.
+    """
+    if not run_id:
+        return None
+    deadline = _time.monotonic() + max(0.0, timeout_seconds)
+    last_size = -1
+    while True:
+        if path.exists():
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = -1
+            if size != last_size:
+                last_size = size
+                try:
+                    records: list[dict] = []
+                    with path.open("r", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line or not line.startswith("{"):
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if obj.get("run_id") == run_id:
+                                records.append(obj)
+                    if records:
+                        return _aggregate_kas_records(records)
+                except OSError:
+                    pass
+        if _time.monotonic() >= deadline:
+            return None
+        _time.sleep(sleep)
+
+
+def _aggregate_kas_records(records: list[dict]) -> dict:
+    """Combine multiple per-turn records from one run_id into one summary.
+
+    Sums: cost_usd, input_tokens, output_tokens, kiro_credits, total_ms.
+    Takes the last record's path/model_id (they should all match).
+    """
+    def _sum_field(field: str) -> float | int | None:
+        vals = [r[field] for r in records if r.get(field) is not None]
+        return sum(vals) if vals else None
+
+    return {
+        "path": records[-1].get("path"),
+        "model_id": records[-1].get("model_id"),
+        "run_id": records[-1].get("run_id"),
+        "cost_usd": _sum_field("cost_usd"),
+        "input_tokens": _sum_field("input_tokens"),
+        "output_tokens": _sum_field("output_tokens"),
+        "kiro_credits": _sum_field("kiro_credits"),
+        "total_ms": _sum_field("total_ms"),
+        "turns": len(records),
+    }
+
+
+def parse_kas_proxy_metrics_usage(
+    pricing: Pricing, run_id: str | None
+) -> Usage:
+    """
+    Read kas-proxy's metrics.jsonl and return Usage for the turn correlated by
+    ``run_id`` (an X-Kas-Run-Id header injected by the harness via KAS_RUN_ID).
+
+    Returns an empty ``Usage()`` when no run_id is supplied (e.g. the proxy
+    isn't in use) or no matching record is found within the timeout.
+
+    Field mapping (kas-proxy metrics → agent_cost_bench Usage):
+      cost_usd          -> Usage.cost_usd            (real billed cost)
+      input_tokens      -> Usage.input_tokens
+      output_tokens     -> Usage.output_tokens
+      kiro_credits      -> Usage.raw_credits          (passthrough only)
+      ttft_ms or ttfb_ms -> Usage.seconds             (best available timing)
+    Both ``openrouter`` and ``passthrough`` records map cleanly; cost_usd is
+    populated by the proxy on both paths (passthrough derived from
+    kiro_credits × kiro_credit_price_usd).
+    """
+    if not run_id:
+        return Usage()
+    path = _kas_metrics_path(pricing)
+    record = _find_kas_metrics_record(
+        path, run_id, pricing.kas_metrics_timeout_seconds
+    )
+    if record is None:
+        return Usage()
+
+    cost = record.get("cost_usd")
+    input_tokens = record.get("input_tokens")
+    output_tokens = record.get("output_tokens")
+    raw_credits = record.get("kiro_credits")
+    # Sum of total_ms across all inference turns for this run_id — the
+    # cumulative time the model spent on inference (excludes tool execution,
+    # file I/O, agent orchestration between turns). More meaningful than
+    # wall-clock for comparing model speed across different agent strategies.
+    total_ms = record.get("total_ms")
+    seconds = (total_ms / 1000.0) if isinstance(total_ms, (int, float)) else None
+
+    return Usage(
+        cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
+        input_tokens=int(input_tokens) if isinstance(input_tokens, (int, float)) else None,
+        output_tokens=int(output_tokens) if isinstance(output_tokens, (int, float)) else None,
+        seconds=seconds,
+        raw_credits=float(raw_credits) if isinstance(raw_credits, (int, float)) else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex CLI JSONL (codex exec --json)
+# ---------------------------------------------------------------------------
+
+# Pricing reference: https://developers.openai.com/api/docs/pricing?latest-pricing=standard
+# All rates below are for standard (non-batch, non-flex) pricing.
+#
+# Cost formula (per OpenAI billing):
+#   uncached_input = input_tokens - cached_input_tokens
+#   cost = (uncached_input      / 1M) × usd_per_input_token
+#        + (cached_input_tokens / 1M) × usd_per_cached_input_token
+#        + (output_tokens       / 1M) × usd_per_output_token
+#
+# NOTE: reasoning_output_tokens is a SUBSET of output_tokens — not additive.
+# The API bills all output tokens (reasoning + visible) at the same output
+# rate. reasoning_output_tokens is an informational breakdown only.
+#
+# Standard rates per 1M tokens (from OpenAI pricing page, June 2026):
+#   Model              input    cached_input    output
+#   o4-mini            $1.10       $0.275        $4.40
+#   o3                 $2.00       $0.500        $8.00
+#   o3-mini            $1.10       $0.550        $4.40
+#   o1                $15.00       $7.500       $60.00
+#   gpt-5.5            $5.00       $0.500       $30.00
+#   gpt-5.5-pro       $30.00          n/a      $180.00
+#   gpt-5.4            $2.50       $0.250       $15.00
+#   gpt-5.4-mini       $0.75       $0.075        $4.50
+#   gpt-5.4-pro       $30.00          n/a      $180.00
+#   gpt-4o             $2.50       $1.250       $10.00
+#   gpt-4.1            $2.00       $0.500        $8.00
+
+
+def compute_codex_cost(
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    reasoning_output_tokens: int,  # informational only — already included in output_tokens
+    pricing: Pricing,
+    cache_write_input_tokens: int = 0,
+) -> float | None:
+    """Compute Codex API cost using OpenAI's standard billing formula.
+
+    Pricing reference: https://developers.openai.com/api/docs/pricing?latest-pricing=standard
+
+    The ``Pricing`` fields are **per-token** rates. In the YAML config, express
+    them as the published per-1M-token rate divided by 1,000,000
+    (e.g. $1.10/1M → ``0.0000011``).
+
+    Formula::
+
+        fresh_input = input_tokens - cached_input_tokens - cache_write_input_tokens
+        cost = fresh_input              × usd_per_input_token
+             + cached_input_tokens      × usd_per_cached_input_token
+             + cache_write_input_tokens × usd_per_cache_write_token
+             + output_tokens            × usd_per_output_token
+
+    ``cache_write_input_tokens`` is a **distinct slice** of ``input_tokens``:
+    tokens written into the prompt cache on this turn. It is reported separately
+    by ``codex exec --json`` and must not be billed at the full fresh-input
+    rate — in practice it dominates ``input_tokens - cached_input_tokens``
+    (observed: 702,443 of 703,051 tokens across a 21-task run), so treating it
+    as fresh input overstates cost by ~20%. OpenAI does not charge a premium for
+    cache writes, so when ``usd_per_cache_write_token`` is not configured we
+    fall back to the *cached* rate rather than the fresh-input rate.
+
+    **Important**: ``reasoning_output_tokens`` is a **subset** of
+    ``output_tokens`` (already included — not additive). The API bills all
+    output tokens at the same rate regardless of whether they are reasoning or
+    visible response tokens. The parameter is accepted for call-site
+    compatibility but is not used in the cost calculation.
+
+    When ``usd_per_cached_input_token`` is absent, cached tokens are billed at
+    the regular input rate (conservative fallback).
+
+    Returns ``None`` when the minimum required rates (input + output) are not
+    configured, so callers can distinguish "no pricing set" from a zero cost.
+    """
+    p_in = pricing.usd_per_input_token
+    p_out = pricing.usd_per_output_token
+    if p_in is None or p_out is None:
+        return None
+
+    # Cached tokens are cheaper; fall back to regular input rate when no
+    # separate cached rate is configured.
+    p_cached = (
+        pricing.usd_per_cached_input_token
+        if pricing.usd_per_cached_input_token is not None
+        else p_in
+    )
+
+    # Cache writes are a distinct slice of input_tokens. OpenAI charges no
+    # premium for them, so default to the cached rate (NOT the fresh-input rate)
+    # when an explicit cache-write rate isn't configured.
+    p_cache_write = (
+        pricing.usd_per_cache_write_token
+        if pricing.usd_per_cache_write_token is not None
+        else p_cached
+    )
+
+    fresh_input = max(0, input_tokens - cached_input_tokens - cache_write_input_tokens)
+    cost = (
+        fresh_input                  * p_in
+        + cached_input_tokens        * p_cached
+        + cache_write_input_tokens   * p_cache_write
+        + output_tokens              * p_out
+        # reasoning_output_tokens intentionally omitted — subset of output_tokens
+    )
+    return cost
+
+
+def parse_codex_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    """Parse ``codex exec --json`` JSONL output.
+
+    Codex streams JSONL events to stdout. Token usage lives in
+    ``turn.completed`` events::
+
+        {"type":"turn.completed","usage":{"input_tokens":N,
+            "cached_input_tokens":N,"output_tokens":N,
+            "reasoning_output_tokens":N}}
+
+    A task may produce multiple turns (the agent loop calls the model several
+    times), so we **sum** tokens across ALL ``turn.completed`` events in the
+    output — the same aggregation behaviour as kas-proxy metrics.
+
+    Cost is computed by :func:`compute_codex_cost`:
+    ``uncached_input × p_in + cached_input × p_cached + output × p_out``.
+    ``reasoning_output_tokens`` is a subset of ``output_tokens`` (already
+    counted there), so it is tracked for reporting but not billed separately.
+
+    Pricing reference: https://developers.openai.com/api/docs/pricing?latest-pricing=standard
+
+    Timing: Codex does not emit a wall-clock duration in the JSONL stream.
+    ``seconds`` is left ``None``; the harness records wall-clock time separately.
+    """
+    in_tok = out_tok = reasoning_tok = cached_tok = cache_write_tok = 0
+    saw_usage = False
+
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "turn.completed":
+            usage = obj.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            saw_usage = True
+            in_tok += int(usage.get("input_tokens") or 0)
+            cached_tok += int(usage.get("cached_input_tokens") or 0)
+            cache_write_tok += int(usage.get("cache_write_input_tokens") or 0)
+            out_tok += int(usage.get("output_tokens") or 0)
+            reasoning_tok += int(usage.get("reasoning_output_tokens") or 0)
+
+    if not saw_usage:
+        return Usage()
+
+    cost = compute_codex_cost(
+        in_tok, cached_tok, out_tok, reasoning_tok, pricing,
+        cache_write_input_tokens=cache_write_tok,
+    )
+
+    return Usage(
+        cost_usd=cost,
+        input_tokens=in_tok or None,
+        cached_input_tokens=cached_tok or None,
+        cache_write_input_tokens=cache_write_tok or None,
+        output_tokens=out_tok or None,
+        reasoning_output_tokens=reasoning_tok or None,
+    )
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI JSON (`cursor -p --output-format json`)
+# ---------------------------------------------------------------------------
+
+
+def parse_cursor_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    """Parse the Cursor CLI headless JSON result.
+
+    Cursor's ``-p --output-format json`` emits a single JSON object (or the last
+    line in stream-json mode) with ``type: "result"`` containing::
+
+        {
+          "type": "result",
+          "duration_ms": 40428,
+          "duration_api_ms": 40428,
+          "is_error": false,
+          "usage": {
+            "inputTokens": 28223,
+            "outputTokens": 4075,
+            "cacheReadTokens": 141280,
+            "cacheWriteTokens": 0
+          }
+        }
+
+    Cost formula (mirrors Codex/Anthropic billing)::
+
+        uncached_input = inputTokens - cacheReadTokens
+        cost = uncached_input    × usd_per_input_token
+             + cacheReadTokens   × usd_per_cached_input_token
+             + outputTokens      × usd_per_output_token
+
+    When ``usd_per_cached_input_token`` is absent, cached tokens are billed at
+    the regular input rate (conservative fallback).
+
+    Cursor's pricing is "public list API prices + $0.25/M total tokens" so the
+    YAML should encode the effective per-token rates inclusive of that markup.
+    """
+    objs = _find_json_objects(stdout) or _find_json_objects(stderr)
+    result_obj = None
+    for o in objs:
+        if o.get("type") == "result":
+            result_obj = o
+    if result_obj is None and objs:
+        result_obj = objs[-1]
+    if not result_obj:
+        return Usage()
+
+    # Duration: prefer duration_api_ms (model time), fall back to duration_ms
+    duration_api = result_obj.get("duration_api_ms")
+    duration_total = result_obj.get("duration_ms")
+    duration_ms = duration_api if isinstance(duration_api, (int, float)) else duration_total
+    seconds = (duration_ms / 1000.0) if isinstance(duration_ms, (int, float)) else None
+
+    # Token usage
+    usage = result_obj.get("usage") or {}
+    in_tok = _safe_int(usage.get("inputTokens"))
+    out_tok = _safe_int(usage.get("outputTokens"))
+    cache_read = _safe_int(usage.get("cacheReadTokens"))
+    cache_write = _safe_int(usage.get("cacheWriteTokens"))
+
+    # Cursor's inputTokens is the NON-cached fresh input (not a total that
+    # includes cache reads). Total input processed = inputTokens + cacheReadTokens
+    # + cacheWriteTokens.
+    total_in = None
+    if in_tok is not None:
+        total_in = in_tok + (cache_read or 0) + (cache_write or 0)
+
+    # Cost computation per Cursor pricing (https://cursor.com/docs/models-and-pricing):
+    #   inputTokens      → billed at usd_per_input_token (Input rate)
+    #   cacheWriteTokens → billed at usd_per_cache_write_token (Cache Write rate)
+    #   cacheReadTokens  → billed at usd_per_cached_input_token (Cache Read rate)
+    #   outputTokens     → billed at usd_per_output_token
+    cost = None
+    p_in = pricing.usd_per_input_token
+    p_out = pricing.usd_per_output_token
+    if p_in is not None and p_out is not None and in_tok is not None and out_tok is not None:
+        p_cache_read = (
+            pricing.usd_per_cached_input_token
+            if pricing.usd_per_cached_input_token is not None
+            else p_in
+        )
+        p_cache_write = (
+            pricing.usd_per_cache_write_token
+            if pricing.usd_per_cache_write_token is not None
+            else p_in
+        )
+        cost = (
+            in_tok * p_in
+            + (cache_write or 0) * p_cache_write
+            + (cache_read or 0) * p_cache_read
+            + out_tok * p_out
+        )
+
+    return Usage(
+        cost_usd=cost,
+        input_tokens=total_in,
+        cached_input_tokens=(cache_read or 0) + (cache_write or 0) if cache_read is not None or cache_write is not None else None,
+        output_tokens=out_tok,
+        seconds=seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI JSON (`agy -p "..." --output-format json`)
+# ---------------------------------------------------------------------------
+
+
+def parse_antigravity_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    """Parse the Antigravity CLI headless JSON result.
+
+    ``agy -p "<prompt>" --output-format json`` prints a single JSON object::
+
+        {
+          "conversation_id": "978c29ed-...",
+          "status": "SUCCESS",
+          "response": "...",
+          "duration_seconds": 5.909435,
+          "num_turns": 1,
+          "usage": {
+            "input_tokens": 5563,
+            "output_tokens": 1250,
+            "thinking_tokens": 611,
+            "cache_read_tokens": 8130,
+            "total_tokens": 6813
+          }
+        }
+
+    Token semantics (mirrors Codex / Cursor billing):
+      - ``input_tokens``       fresh (non-cached) prompt tokens
+      - ``cache_read_tokens``  prompt tokens served from cache (cheaper)
+      - ``output_tokens``      generated tokens
+      - ``thinking_tokens``    reasoning tokens — a SUBSET of ``output_tokens``
+                               (informational only, not billed separately)
+
+    Cost formula::
+
+        cost = input_tokens      × usd_per_input_token
+             + cache_read_tokens  × usd_per_cached_input_token
+             + output_tokens      × usd_per_output_token
+
+    When ``usd_per_cached_input_token`` is absent, cached tokens are billed at
+    the regular input rate (conservative fallback). Returns an empty ``Usage()``
+    when no result object is found. Timing comes from ``duration_seconds``.
+    """
+    objs = _find_json_objects(stdout) or _find_json_objects(stderr)
+    result_obj = None
+    for o in objs:
+        if "usage" in o or o.get("status") or "conversation_id" in o:
+            result_obj = o
+    if result_obj is None and objs:
+        result_obj = objs[-1]
+    if not result_obj:
+        return Usage()
+
+    duration = result_obj.get("duration_seconds")
+    seconds = float(duration) if isinstance(duration, (int, float)) else None
+
+    usage = result_obj.get("usage") or {}
+    in_tok = _safe_int(usage.get("input_tokens"))
+    out_tok = _safe_int(usage.get("output_tokens"))
+    thinking_tok = _safe_int(usage.get("thinking_tokens"))
+    cache_read = _safe_int(usage.get("cache_read_tokens"))
+
+    # Total input processed = fresh input + cache reads.
+    total_in = None
+    if in_tok is not None or cache_read is not None:
+        total_in = (in_tok or 0) + (cache_read or 0)
+
+    cost = None
+    p_in = pricing.usd_per_input_token
+    p_out = pricing.usd_per_output_token
+    if p_in is not None and p_out is not None and in_tok is not None and out_tok is not None:
+        p_cached = (
+            pricing.usd_per_cached_input_token
+            if pricing.usd_per_cached_input_token is not None
+            else p_in
+        )
+        cost = (
+            in_tok * p_in
+            + (cache_read or 0) * p_cached
+            + out_tok * p_out
+            # thinking_tokens intentionally omitted — subset of output_tokens
+        )
+
+    return Usage(
+        cost_usd=cost,
+        input_tokens=total_in,
+        cached_input_tokens=cache_read,
+        output_tokens=out_tok,
+        reasoning_output_tokens=thinking_tok,
+        seconds=seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Devin CLI ATIF export (`devin -p --export <file>`)
+# ---------------------------------------------------------------------------
+
+
+def parse_devin_usage(pricing: Pricing, workspace: Path | None) -> Usage:
+    """Parse the Devin CLI's ATIF conversation export for token usage.
+
+    The Devin CLI has no ``--output-format json`` flag and prints only the
+    assistant's prose to stdout, so there is no cost telemetry to scrape from
+    the transcript. It does however write a machine-readable ATIF export when
+    invoked with ``--export <file>``, whose trailing ``final_metrics`` block
+    carries the cumulative token counts for the whole session::
+
+        {
+          "schema_version": "ATIF-v1.7",
+          "agent": {"name": "devin", "model_name": "Claude Opus 5", ...},
+          "steps": [...],
+          "final_metrics": {
+            "total_prompt_tokens": 19249,
+            "total_completion_tokens": 4,
+            "total_cached_tokens": 12262,
+            "total_steps": 9
+          }
+        }
+
+    The export is written relative to the CLI's cwd — the run's workspace — so
+    the file is read from ``workspace / pricing.devin_export_file``.
+
+    ``total_prompt_tokens`` is **inclusive** of ``total_cached_tokens`` (the
+    same convention as Codex's ``input_tokens``/``cached_input_tokens``), so the
+    uncached portion must be backed out before pricing::
+
+        uncached_input = total_prompt_tokens - total_cached_tokens
+        cost = uncached_input       × usd_per_input_token
+             + total_cached_tokens  × usd_per_cached_input_token
+             + total_completion_tokens × usd_per_output_token
+
+    When ``usd_per_cached_input_token`` is absent, cached tokens are billed at
+    the regular input rate (conservative fallback), matching the Codex and
+    Cursor parsers.
+
+    Devin bills the account in credits/ACUs rather than USD and reports neither
+    in the export, so cost is computed from the per-token rates in the config
+    (Devin publishes per-MTok rates via ``devin models list``). ``seconds`` is
+    left ``None`` — the export carries per-step timestamps but no authoritative
+    model-time total, so the harness's own wall-clock measurement is used.
+
+    Returns an empty ``Usage()`` when the export is missing or unreadable (e.g.
+    the CLI died before writing it), so a failed run reports "no cost data"
+    rather than a misleading zero.
+    """
+    if workspace is None:
+        return Usage()
+    path = Path(workspace) / pricing.devin_export_file
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return Usage()
+    try:
+        export = json.loads(raw)
+    except json.JSONDecodeError:
+        return Usage()
+    if not isinstance(export, dict):
+        return Usage()
+
+    metrics = export.get("final_metrics")
+    if not isinstance(metrics, dict):
+        return Usage()
+
+    prompt_tokens = _safe_int(metrics.get("total_prompt_tokens"))
+    completion_tokens = _safe_int(metrics.get("total_completion_tokens"))
+    cached_tokens = _safe_int(metrics.get("total_cached_tokens"))
+    if prompt_tokens is None and completion_tokens is None:
+        return Usage()
+
+    in_tok = prompt_tokens or 0
+    out_tok = completion_tokens or 0
+    cached = cached_tokens or 0
+
+    cost = None
+    p_in = pricing.usd_per_input_token
+    p_out = pricing.usd_per_output_token
+    if p_in is not None and p_out is not None:
+        p_cached = (
+            pricing.usd_per_cached_input_token
+            if pricing.usd_per_cached_input_token is not None
+            else p_in
+        )
+        uncached_input = max(0, in_tok - cached)
+        cost = uncached_input * p_in + cached * p_cached + out_tok * p_out
+
+    return Usage(
+        cost_usd=cost,
+        input_tokens=in_tok or None,
+        cached_input_tokens=cached or None,
+        output_tokens=out_tok or None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# pi CLI JSONL (`pi -p --mode json`)
+# ---------------------------------------------------------------------------
+
+
+def parse_pi_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    """Parse the pi coding agent's ``-p --mode json`` JSON-Lines stream.
+
+    ``pi`` streams one self-describing JSON object per line. Usage is attached to
+    every assistant message, but the authoritative per-turn total is the
+    ``turn_end`` event::
+
+        {"type":"turn_end","message":{
+            "role":"assistant","provider":"example-provider",
+            "model":"global.anthropic.claude-sonnet-5",
+            "usage":{"input":3,"output":70,"cacheRead":0,"cacheWrite":6512,
+                     "totalTokens":6585,
+                     "cost":{"input":0.000009,"output":0.00105,"cacheRead":0,
+                             "cacheWrite":0.02442,"total":0.025479}},
+            "stopReason":"toolUse","timestamp":1789580503571},
+         "toolResults":[…]}
+
+    An agentic run makes several model calls, so token counts and cost are
+    **summed across every** ``turn_end`` **event** (the same aggregation the
+    Codex parser applies to ``turn.completed``). ``message_end`` events carry the
+    same numbers as their enclosing turn and are deliberately ignored so nothing
+    is counted twice. When the stream contains no ``turn_end`` at all (e.g. the
+    run was killed mid-turn), the assistant messages listed in the final
+    ``agent_end`` event are used instead.
+
+    Token semantics — ``input`` is the **fresh, non-cached** prompt slice, with
+    ``cacheRead`` and ``cacheWrite`` reported alongside it (verified against a
+    real run: turn 1 wrote 6512 tokens to cache, turn 2 read exactly those 6512
+    back). Total input processed is therefore
+    ``input + cacheRead + cacheWrite``.
+
+    Cost: unlike Cursor/Codex/Antigravity, ``pi`` prices the turn itself from its
+    bundled model catalog and reports USD directly, so the reported
+    ``cost.total`` is preferred and **no pricing config is required** — the same
+    arrangement as Claude Code's ``total_cost_usd``. Per-token rates in
+    ``pricing`` are used only as a fallback when the stream carries no cost
+    figure (an unpriced or custom model), computed as::
+
+        cost = input      × usd_per_input_token
+             + cacheRead  × usd_per_cached_input_token
+             + cacheWrite × usd_per_cache_write_token
+             + output     × usd_per_output_token
+
+    Timing comes from the span between the first and last event timestamp
+    (``pi`` reports no duration field); ``None`` when fewer than two timestamps
+    are present.
+    """
+    in_tok = out_tok = cache_read = cache_write = 0
+    reported_cost = 0.0
+    saw_usage = False
+    saw_cost = False
+    timestamps: list[float] = []
+
+    def _accumulate(msg: dict) -> None:
+        nonlocal in_tok, out_tok, cache_read, cache_write, reported_cost
+        nonlocal saw_usage, saw_cost
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            return
+        saw_usage = True
+        in_tok += _safe_int(usage.get("input")) or 0
+        out_tok += _safe_int(usage.get("output")) or 0
+        cache_read += _safe_int(usage.get("cacheRead")) or 0
+        cache_write += _safe_int(usage.get("cacheWrite")) or 0
+        cost = usage.get("cost")
+        if isinstance(cost, dict) and isinstance(cost.get("total"), (int, float)):
+            reported_cost += float(cost["total"])
+            saw_cost = True
+
+    objs = _find_json_objects(stdout) or _find_json_objects(stderr)
+    agent_end: dict | None = None
+    for obj in objs:
+        etype = obj.get("type")
+        msg = obj.get("message")
+        if isinstance(msg, dict) and isinstance(msg.get("timestamp"), (int, float)):
+            timestamps.append(float(msg["timestamp"]))
+        if etype == "turn_end" and isinstance(msg, dict):
+            _accumulate(msg)
+        elif etype == "agent_end":
+            agent_end = obj
+
+    # Fallback: no turn_end in the stream (killed mid-turn) — take the assistant
+    # messages from the final agent_end summary instead.
+    if not saw_usage and agent_end is not None:
+        for msg in agent_end.get("messages") or []:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                _accumulate(msg)
+
+    if not saw_usage:
+        return Usage()
+
+    total_in = in_tok + cache_read + cache_write
+
+    # A reported cost of exactly zero alongside real token usage is not
+    # credible — it means this model/route reported no price rather than that
+    # the turn was free. Fall through to the configured rates in that case (and
+    # to `None` when none are set) instead of publishing $0.00. Observed with
+    # some model routes: a rejected request emits
+    # stopReason:"error" with all-zero usage AND all-zero cost — there
+    # genuinely was no charge, and tokens are zero too, so $0.00 stands.
+    if saw_cost and reported_cost == 0.0 and (total_in + out_tok) > 0:
+        saw_cost = False
+
+    if saw_cost:
+        cost_usd: float | None = reported_cost
+    else:
+        cost_usd = None
+        p_in = pricing.usd_per_input_token
+        p_out = pricing.usd_per_output_token
+        if p_in is not None and p_out is not None:
+            p_cache_read = (
+                pricing.usd_per_cached_input_token
+                if pricing.usd_per_cached_input_token is not None
+                else p_in
+            )
+            p_cache_write = (
+                pricing.usd_per_cache_write_token
+                if pricing.usd_per_cache_write_token is not None
+                else p_in
+            )
+            cost_usd = (
+                in_tok * p_in
+                + cache_read * p_cache_read
+                + cache_write * p_cache_write
+                + out_tok * p_out
+            )
+
+    seconds = None
+    if len(timestamps) >= 2:
+        span = (max(timestamps) - min(timestamps)) / 1000.0
+        seconds = span if span > 0 else None
+
+    return Usage(
+        cost_usd=cost_usd,
+        input_tokens=total_in or None,
+        cached_input_tokens=(cache_read + cache_write) or None,
+        output_tokens=out_tok or None,
+        seconds=seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Qoder CLI JSON (`qodercli -p "..." -o json`)
+# ---------------------------------------------------------------------------
+
+def parse_qoder_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    """Parse the Qoder CLI's ``-p -o json`` result object.
+
+    Qoder prints a single Claude-Code-shaped ``type: "result"`` object. The
+    run totals live at its top level::
+
+        {
+          "type": "result",
+          "duration_ms": 12622,
+          "total_cost_usd": 0,
+          "total_credits": 0.6097,
+          "usage": {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0
+          },
+          "modelUsage": {"auto": {...}}
+        }
+
+    Qoder bills in credits and reports ``total_cost_usd`` as 0, so cost is::
+
+        cost = total_credits × usd_per_credit
+
+    ``usd_per_credit`` comes from the runner's ``pricing`` block. When it is
+    unset, cost is unknown (``None``), the same as Kiro; the reported
+    ``total_cost_usd: 0`` is not used because it would read as "free". Native
+    credits are always kept in ``raw_credits``. ``total_cost_usd`` is used only
+    when the output carries no ``total_credits``. The per-model ``modelUsage``
+    breakdown is not read: the top-level fields are already the run totals.
+
+    Token semantics follow Claude Code: ``input_tokens`` is the fresh slice, so
+    total input = ``input_tokens + cache_read_input_tokens +
+    cache_creation_input_tokens``. All-zero token counts are reported as
+    unknown (``None``) rather than 0, since a completed turn always consumes
+    tokens.
+    """
+    objs = _find_json_objects(stdout) or _find_json_objects(stderr)
+    result_obj = None
+    for o in objs:
+        if o.get("type") == "result":
+            result_obj = o
+    if result_obj is None and objs:
+        result_obj = objs[-1]
+    if not result_obj:
+        return Usage()
+
+    total_credits = result_obj.get("total_credits")
+    credits = float(total_credits) if isinstance(total_credits, (int, float)) else None
+    if credits is not None:
+        cost_usd = (
+            credits * pricing.usd_per_credit if pricing.usd_per_credit is not None else None
+        )
+    else:
+        total_cost = result_obj.get("total_cost_usd")
+        cost_usd = float(total_cost) if isinstance(total_cost, (int, float)) else None
+
+    usage = result_obj.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    in_tok = _safe_int(usage.get("input_tokens")) or 0
+    out_tok = _safe_int(usage.get("output_tokens")) or 0
+    cache_read = _safe_int(usage.get("cache_read_input_tokens")) or 0
+    cache_write = _safe_int(usage.get("cache_creation_input_tokens")) or 0
+
+    duration_ms = result_obj.get("duration_ms")
+    seconds = (duration_ms / 1000.0) if isinstance(duration_ms, (int, float)) else None
+
+    total_in = in_tok + cache_read + cache_write
+    return Usage(
+        cost_usd=cost_usd,
+        input_tokens=total_in or None,
+        cached_input_tokens=cache_read or None,
+        cache_write_input_tokens=cache_write or None,
+        output_tokens=out_tok or None,
+        seconds=seconds,
+        raw_credits=credits,
+    )
+
+
+def parse_token_regex_usage(
+    stdout: str, stderr: str, pricing: Pricing, token_regex: str | None
+) -> Usage:
+    if not token_regex:
+        return Usage()
+    rx = re.compile(token_regex, re.IGNORECASE)
+    combined = f"{stderr}\n{stdout}"
+    m = None
+    for match in rx.finditer(combined):
+        m = match
+    if not m:
+        return Usage()
+    gd = m.groupdict()
+    in_tok = int(gd["input"]) if gd.get("input") else None
+    out_tok = int(gd["output"]) if gd.get("output") else None
+    cost = None
+    if (
+        in_tok is not None
+        and out_tok is not None
+        and pricing.usd_per_input_token is not None
+        and pricing.usd_per_output_token is not None
+    ):
+        cost = in_tok * pricing.usd_per_input_token + out_tok * pricing.usd_per_output_token
+    return Usage(cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok)
+
+
+def parse_premium_request_usage(pricing: Pricing) -> Usage:
+    reqs = pricing.requests_per_run
+    cost = (
+        reqs * pricing.usd_per_premium_request
+        if pricing.usd_per_premium_request is not None
+        else None
+    )
+    return Usage(cost_usd=cost, premium_requests=reqs)
+
+
+# ---------------------------------------------------------------------------
+# OpenCode CLI JSON (`opencode run --format json`)
+# ---------------------------------------------------------------------------
+
+
+def parse_opencode_usage(stdout: str, stderr: str, pricing: Pricing) -> Usage:
+    """Parse ``opencode run --format json`` JSONL output.
+
+    OpenCode streams JSONL events to stdout. Token usage and cost live in
+    ``step_finish`` events (nested under ``part``):
+
+        {"type":"step_finish",...,"part":{...,"tokens":{"total":N,"input":N,
+            "output":N,"reasoning":N,"cache":{"write":N,"read":N}},"cost":0.02973}}
+
+    A task may produce multiple step_finish events (multi-step agent loops),
+    so we sum tokens and cost across ALL step_finish events.
+
+    The ``cost`` field in step_finish is direct USD (reported by the provider).
+    When present, it takes precedence over token-based calculation. If cost is
+    not available but tokens are, we fall back to computing cost from pricing
+    rates using the same formula as codex.
+    """
+    in_tok = out_tok = reasoning_tok = cached_read = cached_write = 0
+    total_cost = 0.0
+    saw_usage = False
+
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "step_finish":
+            continue
+        part = obj.get("part")
+        if not isinstance(part, dict):
+            continue
+
+        # Direct cost (USD) from the provider
+        cost_val = part.get("cost")
+        if cost_val is not None:
+            total_cost += float(cost_val)
+
+        tokens = part.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        saw_usage = True
+        in_tok += int(tokens.get("input") or 0)
+        out_tok += int(tokens.get("output") or 0)
+        reasoning_tok += int(tokens.get("reasoning") or 0)
+        cache = tokens.get("cache")
+        if isinstance(cache, dict):
+            cached_read += int(cache.get("read") or 0)
+            cached_write += int(cache.get("write") or 0)
+
+    if not saw_usage:
+        return Usage()
+
+    # Prefer the direct cost reported by opencode; fall back to token-based
+    # calculation if cost field was missing/zero but tokens were present.
+    cost_usd: float | None = None
+    if total_cost > 0:
+        cost_usd = total_cost
+    else:
+        cost_usd = compute_codex_cost(in_tok, cached_read, out_tok, reasoning_tok, pricing)
+
+    return Usage(
+        cost_usd=cost_usd,
+        input_tokens=in_tok or None,
+        cached_input_tokens=cached_read or None,
+        output_tokens=out_tok or None,
+        reasoning_output_tokens=reasoning_tok or None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+
+def parse_usage(
+    target: Target,
+    stdout: str,
+    stderr: str = "",
+    home: Path | None = None,
+    run_id: str | None = None,
+    workspace: Path | None = None,
+) -> Usage:
+    """Parse usage for a target according to its ``cost_source``.
+
+    ``run_id`` is the per-turn correlation id used by the kas_proxy_metrics
+    parser (passed through X-Kas-Run-Id by the shim, into the proxy's
+    metrics.jsonl); ignored by other cost sources.
+
+    ``workspace`` is the run's workspace directory, used by the devin_export
+    parser to locate the ATIF export the CLI wrote there; ignored by other
+    cost sources.
+    """
+    src = target.cost_source
+    p = target.pricing
+    if src == CostSource.KIRO_CREDITS:
+        return parse_kiro_usage(stdout, stderr, p)
+    if src == CostSource.CLAUDE_JSON:
+        return parse_claude_usage(stdout, stderr, p)
+    if src == CostSource.COPILOT_JSON:
+        return parse_copilot_usage(stdout, stderr, p, home=home)
+    if src == CostSource.CODEX_JSON:
+        return parse_codex_usage(stdout, stderr, p)
+    if src == CostSource.OPENCODE_JSON:
+        return parse_opencode_usage(stdout, stderr, p)
+    if src == CostSource.CURSOR_JSON:
+        return parse_cursor_usage(stdout, stderr, p)
+    if src == CostSource.ANTIGRAVITY_JSON:
+        return parse_antigravity_usage(stdout, stderr, p)
+    if src == CostSource.DEVIN_EXPORT:
+        return parse_devin_usage(p, workspace)
+    if src == CostSource.PI_JSON:
+        return parse_pi_usage(stdout, stderr, p)
+    if src == CostSource.QODER_JSON:
+        return parse_qoder_usage(stdout, stderr, p)
+    if src == CostSource.KAS_PROXY_METRICS:
+        return parse_kas_proxy_metrics_usage(p, run_id)
+    if src == CostSource.TOKENS:
+        return parse_token_regex_usage(stdout, stderr, p, target.token_regex)
+    if src == CostSource.PREMIUM_REQUEST:
+        return parse_premium_request_usage(p)
+    return Usage()
