@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Build the agent-cost-bench verification images (one per language) with warmed
+# dependency caches so per-task verification can run offline (--network=none).
+#
+#   ./tasks/docker/build-images.sh            # build all
+#   ./tasks/docker/build-images.sh dotnet     # build one
+#
+# Requires Docker. The host needs NO language SDKs — they live in the images.
+# Set CONTAINER_RUNTIME=finch to build with Finch instead; verification reads the
+# same variable, so the images must be built into whichever daemon will run them.
+# Base images are pulled from their authoritative registries:
+#   dotnet  — mcr.microsoft.com (Microsoft's own registry, no rate limits)
+#   java    — Docker Hub official eclipse-temurin (Adoptium OpenJDK, cloud-neutral)
+#   node    — Docker Hub official node
+#   helm    — Docker Hub official python (slim), Helm binary layered on top
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+RUNTIME="${CONTAINER_RUNTIME:-docker}"
+
+build() {
+  local lang="$1" tag="$2"
+  echo "==> Building $tag from $DIR/$lang"
+  "$RUNTIME" build -t "$tag" "$DIR/$lang"
+}
+
+targets=("${@:-all}")
+want() { [[ "${targets[0]}" == "all" ]] || printf '%s\n' "${targets[@]}" | grep -qx "$1"; }
+
+want dotnet && build dotnet "agent-cost-bench-dotnet:8.0"
+want java   && build java   "agent-cost-bench-java:17"
+want node   && build node   "agent-cost-bench-node:20"
+want helm   && build helm   "agent-cost-bench-helm:3.16"
+
+echo "Done. Images:"
+"$RUNTIME" images | grep -E 'agent-cost-bench-(dotnet|java|node|helm)' || true

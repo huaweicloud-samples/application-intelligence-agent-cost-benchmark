@@ -1,0 +1,57 @@
+id: openai-compatible-sentiment
+mode: vibe
+description: "Implement tweet-text sentiment analysis against an OpenAI-compatible inference endpoint (such as Huawei Cloud MaaS) in a small Python service"
+timeout_minutes: 20
+effort: high
+
+# 6 of 8 criteria must be met to pass (75%).
+functional_pass_threshold: 0.75
+
+prompt: |
+  You are building a small Python service that classifies the SENTIMENT of tweet
+  text. The sentiment model is served behind an OpenAI-compatible Chat
+  Completions endpoint (for example Huawei Cloud MaaS, which exposes an
+  /v1/chat/completions surface compatible with the OpenAI SDK). Your job is to
+  implement the classifier — not to stand up the model.
+
+  Create a module `sentiment.py` in the current directory that exposes:
+
+      def get_sentiment(tweet_text: str, *, base_url: str | None = None,
+                        model: str | None = None, api_key: str | None = None) -> str:
+          ...
+
+  Requirements:
+  1. The function sends `tweet_text` to an OpenAI-compatible Chat Completions
+     endpoint (POST `<base_url>/chat/completions`) with a prompt that asks the
+     model to classify the sentiment of that text into exactly one of
+     POSITIVE / NEGATIVE / NEUTRAL / MIXED.
+  2. Parse the model's response down to a SINGLE sentiment label. Do not store the
+     raw model output verbatim as the sentiment.
+  3. Return value stays one of POSITIVE, NEGATIVE, NEUTRAL, MIXED (uppercase) so
+     any downstream consumer that expects that set keeps working unchanged.
+  4. Preserve resilience: if the HTTP call fails (network error, non-2xx status,
+     timeout, malformed JSON), return a safe default sentiment ("NEUTRAL") instead
+     of raising — the caller must never crash on a model/transport error.
+  5. Make `base_url`, `model`, and `api_key` configurable (parameters and/or
+     environment variables such as `OPENAI_BASE_URL`, `OPENAI_MODEL`,
+     `OPENAI_API_KEY`) so the endpoint can be swapped without code changes.
+  6. Use only the Python standard library (urllib) or a widely-available HTTP
+     client (requests) — no cloud-SDK-specific imports. Keep the dependency
+     surface minimal.
+
+  Do not add a web framework or database; a single importable function plus a
+  small `__main__` demo (reading text from stdin / argv) is enough.
+
+# No-code quality grading: the judge inspects the produced code against each
+# criterion. Requires `judge_model` in your model-compare / cli-compare config.
+quality:
+  rubric:
+    - "The tweet-text sentiment is produced by calling an OpenAI-compatible Chat Completions endpoint (a POST to a `<base_url>/chat/completions` URL, not a cloud-specific SDK)"
+    - "The previous/placeholder sentiment source (if any) is no longer the source of the tweet sentiment value"
+    - "The endpoint receives the tweet text with a prompt that instructs it to classify the sentiment of that text into one of POSITIVE / NEGATIVE / NEUTRAL / MIXED"
+    - "The model's response is parsed to extract a single sentiment label — the raw model output is not stored verbatim as the sentiment"
+    - "The resulting sentiment value stays compatible with the expected set: one of POSITIVE / NEGATIVE / NEUTRAL / MIXED (uppercase) is returned"
+    - "The call is wrapped in error handling that returns a safe default sentiment (e.g. 'NEUTRAL') on failure, so a network/transport/model error does not crash the caller"
+    - "base_url / model / api_key are configurable (parameters and/or environment variables) so the inference endpoint can be swapped without code changes"
+    - "Only standard-library or common HTTP-client imports are used — no cloud-provider-specific SDK imports; the dependency surface is minimal"
+  reference_solution: ref/correct_implementation.md
